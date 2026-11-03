@@ -88,7 +88,7 @@ suppressPackageStartupMessages({
 # 1. CONFIGURACIÓN
 # ================================================================
 
-data_dir <- "C:\\Users\\aaceccato\\Documents\\OneDrive - tauli.cat\\citometria\\Resultados citometria Aspirado"
+data_dir <- ""
 
 output_dir <- file.path(
   data_dir,
