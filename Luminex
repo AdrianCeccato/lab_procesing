@@ -1,0 +1,619 @@
+
+###############################################################################
+# PARTE 1 — 
+###############################################################################
+library(drLumi)
+library(reshape2)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(pheatmap)
+
+setwd("")
+# Helper para detectar muestras que contengan "BV"
+is_bv_sample <- function(x) {
+  grepl("BV", x, ignore.case = TRUE)
+}
+
+
+
+all_files <- list.files(pattern="\\.csv$")
+
+all_results <- data.frame()
+
+for(i in seq_along(all_files)){
+  
+  message("Procesando archivo: ", all_files[i])
+  
+  all <- lum_import(all_files[i])
+  exp <- lum_export(all)
+  
+  data <- as.data.frame(exp$well)
+  
+  ###########################################################################
+  ### 1. EXTRAER Plate_number Y Position DESDE TU FORMATO REAL ("P1_B1")
+  ###########################################################################
+  data$Plate_number <- as.numeric(sub("P", "", sub("_.*", "", data$well)))
+  data$Position     <- sub(".*_", "", data$well)   # B1, C7, A12 …
+  
+  ###########################################################################
+  ### 2. LIMPIEZA: eliminar standards, background y total events
+  ###########################################################################
+  data <- data[!grepl("Standard", data$sample), ]
+  data <- data[!grepl("Background", data$sample), ]
+  data <- data[!grepl("Total Events", data$analyte), ]
+  
+  # Mantener solo samples que contengan "BV"
+  data <- data[is_bv_sample(data$sample), ]
+  
+  # Si no queda nada en este archivo, pasar al siguiente
+  if (nrow(data) == 0) {
+    message("No hay muestras BV en: ", all_files[i], ". Se omite.")
+    next
+  }
+  
+  
+  colnames(data)[colnames(data)=="Result"] <- "result"
+  data$count <- as.numeric(data$count)
+  
+  ###########################################################################
+  ### 3. CALCULAR LLQ / ULQ (igual que tu script)
+  ###########################################################################
+  tmp_avg      <- as.data.frame(all[["dtblock"]][["Avg Result"]])
+  tmp_expected <- as.data.frame(all[["dtblock"]][["Standard Expected Concentration"]])
+  tmp_dilution <- as.numeric(all[["dtblock"]][["Dilution Factor"]][30,3])
+  
+  #### --- LLQ ---
+  low_df <- rbind(
+    subset(tmp_avg, Sample=="Standard7"),
+    subset(tmp_avg, Sample=="Standard6"),
+    subset(tmp_avg, Sample=="Standard5"),
+    subset(tmp_avg, Sample=="Standard4")
+  )
+  low_df[,-1] <- lapply(low_df[,-1], as.numeric)
+  
+  low_min <- as.data.frame(lapply(low_df, min, na.rm=TRUE))
+  colnames(low_min) <- colnames(tmp_avg)
+  low_min$Sample <- NULL
+  
+  low_melt <- melt(low_min)
+  low_df_m <- melt(low_df, id.vars="Sample")
+  low_merge <- merge(low_df_m, low_melt, by=c("variable","value"))
+  low_merge$value <- NULL
+  
+  tmp_e <- tmp_expected
+  colnames(tmp_e)[1] <- "Sample"
+  tmp_e_m <- melt(tmp_e, id.vars="Sample")
+  
+  LLQ_final <- merge(tmp_e_m, low_merge, by=c("Sample","variable"))
+  LLQ_final$Sample <- NULL
+  colnames(LLQ_final) <- c("analyte","LLQ")
+  LLQ_final$LLQ <- as.numeric(LLQ_final$LLQ) * tmp_dilution
+  
+  #### --- ULQ ---
+  hi_df <- rbind(
+    subset(tmp_avg, Sample=="Standard4"),
+    subset(tmp_avg, Sample=="Standard3"),
+    subset(tmp_avg, Sample=="Standard2"),
+    subset(tmp_avg, Sample=="Standard1")
+  )
+  hi_df[,-1] <- lapply(hi_df[,-1], as.numeric)
+  
+  hi_max <- as.data.frame(lapply(hi_df, max, na.rm=TRUE))
+  colnames(hi_max) <- colnames(tmp_avg)
+  hi_max$Sample <- NULL
+  
+  hi_melt <- melt(hi_max)
+  hi_df_m <- melt(hi_df, id.vars="Sample")
+  hi_merge <- merge(hi_df_m, hi_melt, by=c("variable","value"))
+  hi_merge$value <- NULL
+  
+  tmp_e_m2 <- melt(tmp_e, id.vars="Sample")
+  
+  ULQ_final <- merge(tmp_e_m2, hi_merge, by=c("Sample","variable"))
+  ULQ_final$Sample <- NULL
+  colnames(ULQ_final) <- c("analyte","ULQ")
+  ULQ_final$ULQ <- as.numeric(ULQ_final$ULQ) * tmp_dilution
+  
+  #### --- MERGE ---
+  data$analyte <- as.character(data$analyte)
+  LLQ_final$analyte  <- as.character(LLQ_final$analyte)
+  ULQ_final$analyte  <- as.character(ULQ_final$analyte)
+  LLQ_final <- LLQ_final %>%
+    dplyr::group_by(analyte) %>%
+    dplyr::summarise(LLQ = suppressWarnings(min(as.numeric(LLQ), na.rm = TRUE)), .groups = "drop")
+  
+  ULQ_final <- ULQ_final %>%
+    dplyr::group_by(analyte) %>%
+    dplyr::summarise(ULQ = suppressWarnings(max(as.numeric(ULQ), na.rm = TRUE)), .groups = "drop")
+  
+  data <- merge(data, LLQ_final, by="analyte")
+  data <- merge(data, ULQ_final, by="analyte")
+  
+  ###########################################################################
+  ### 4. QUALITY CHECK
+  ###########################################################################
+
+  # Patrones robustos para '>' y '<' al inicio (aceptan >, &gt;, &amp;gt; con espacios)
+  pat_gt <- "^\\s*(?:&amp;gt;|&gt;|>)\\s*"
+  pat_lt <- "^\\s*(?:&amp;lt;|&lt;|<)\\s*"
+  
+  is_gt <- grepl(pat_gt, data$result)
+  is_lt <- grepl(pat_lt, data$result)
+  
+  # 1) Valor base sin símbolo (solo para los casos que no tienen >/<)
+  stripped <- gsub(pat_gt, "", data$result)
+  stripped <- gsub(pat_lt, "", stripped)
+  val_base <- suppressWarnings(as.numeric(stripped))
+  
+  # 2) Imputación pedida:
+  #    - si trae '>' → usar ULQ
+  #    - si trae '<' → usar LLQ
+  #    - si es numérico → usar el propio valor
+  data$result_num <- ifelse(
+    is_gt, data$ULQ,
+    ifelse(is_lt, data$LLQ, val_base)
+  )
+  
+  # 3) QC beads (igual que tu lógica)
+  data$Quality_check_beads <- "Good Bead Count"
+  data$Quality_check_beads <- ifelse(data$count < 50, "Low Acceptable Bead Count", data$Quality_check_beads)
+  data$Quality_check_beads <- ifelse(data$count < 25, "Low Bead Count",           data$Quality_check_beads)
+  
+  # 4) QC por símbolo (con tus etiquetas originales)
+  data$Quality_check <- "Good quality"
+  data$Quality_check[is_gt] <- "Above ULQ - set to non-calculated ULQ"
+  data$Quality_check[is_lt] <- "Under LLQ - set to non-calculated LLQ"
+  
+  # 5) Reglas 'Extrapolated' (manteniendo tu criterio)
+  if ("comments" %in% colnames(data)) {
+    data$Quality_check <- ifelse(
+      data$comments == "Extrapolated" & !is.na(data$result_num) & !is.na(data$ULQ) & data$result_num > data$ULQ * 0.1,
+      "Above ULQ - extrapolated based on standard curve",
+      data$Quality_check
+    )
+    data$Quality_check <- ifelse(
+      data$comments == "Extrapolated" & !is.na(data$result_num) & !is.na(data$LLQ) & data$result_num < data$LLQ * 10,
+      "Under LLQ - extrapolated based on standard curve",
+      data$Quality_check
+    )
+  }
+  
+  ###########################################################################
+  ### 5. FORMATO FINAL (Concentration queda NUMÉRICA tras la imputación)
+  ###########################################################################
+  data <- data %>%
+    rename(variable = analyte,
+           Beads    = count) %>%
+    mutate(
+      Concentration = data$result_num  # ← numérica y ya imputada
+    ) %>%
+    select(Plate_number, Position, variable,
+           Concentration,            # numérico final (sin símbolos)
+           Beads, LLQ, ULQ,
+           Quality_check_beads, Quality_check, sample)
+
+  
+  ###########################################################################
+  ### 6. EXPORTAR
+  ###########################################################################
+  write.csv2(
+    data,
+    paste0(sub("\\.csv","",all_files[i]), "_PROCESSED.csv"),
+    row.names = FALSE
+  )
+  
+  all_results <- rbind(all_results, data)
+}
+
+###############################################################################
+# PARTE 2 — POST-PROCESAMIENTO 
+###############################################################################
+library(officer)
+library(flextable)
+
+# Si existiera un segundo objeto all_results1, lo integramos; si no, usamos solo all_results
+all_results1 <- if (exists("all_results1")) get("all_results1") else NULL
+combined_results <- dplyr::bind_rows(all_results, all_results1)
+
+# -------------- (2) TABLA QC (formato n(%)), export a CSV y a Word --------------
+
+# Helper para n(%)
+mk_npct <- function(n, total) {
+  # n puede tener NA -> lo pasamos a 0 para el formato n(%)
+  n <- ifelse(is.na(n), 0L, n)
+  paste0(n, " (", sprintf("%.1f", 100 * n / ifelse(total > 0, total, NA_real_)), "%)")
+}
+
+qc_counts <- combined_results %>%
+  group_by(variable) %>%
+  summarise(
+    Total_Samples = n(),
+    
+    # Bead Count (conteos)
+    Good_Bead_Count_n             = sum(Quality_check_beads == "Good Bead Count",             na.rm = TRUE),
+    Low_Bead_Count_n              = sum(Quality_check_beads == "Low Bead Count",              na.rm = TRUE),
+    Low_Acceptable_Bead_Count_n   = sum(Quality_check_beads == "Low Acceptable Bead Count",   na.rm = TRUE),
+    
+    # Quality Check (conteos)
+    Above_ULQ_extrap_n = sum(Quality_check == "Above ULQ - extrapolated based on standard curve", na.rm = TRUE),
+    Above_ULQ_set_n    = sum(Quality_check == "Above ULQ - set to non-calculated ULQ",            na.rm = TRUE),
+    Good_quality_n     = sum(Quality_check == "Good quality",                                      na.rm = TRUE),
+    Under_LLQ_extrap_n = sum(Quality_check == "Under LLQ - extrapolated based on standard curve",  na.rm = TRUE),
+    Under_LLQ_set_n    = sum(Quality_check == "Under LLQ - set to non-calculated LLQ",            na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Armar tabla final en formato n(%)
+qc_table_npct <- qc_counts %>%
+  mutate(
+    `Good Bead Count n(%)`             = mk_npct(Good_Bead_Count_n,           Total_Samples),
+    `Low Bead Count n(%)`              = mk_npct(Low_Bead_Count_n,            Total_Samples),
+    `Low Acceptable Bead Count n(%)`   = mk_npct(Low_Acceptable_Bead_Count_n, Total_Samples),
+    
+    `Above ULQ - extrapolated based on standard curve n(%)` = mk_npct(Above_ULQ_extrap_n, Total_Samples),
+    `Above ULQ - set to non-calculated ULQ n(%)`            = mk_npct(Above_ULQ_set_n,    Total_Samples),
+    `Good quality n(%)`                                     = mk_npct(Good_quality_n,     Total_Samples),
+    `Under LLQ - extrapolated based on standard curve n(%)` = mk_npct(Under_LLQ_extrap_n, Total_Samples),
+    `Under LLQ - set to non-calculated LLQ n(%)`            = mk_npct(Under_LLQ_set_n,    Total_Samples)
+  ) %>%
+  # Dejamos únicamente variable, Total_Samples y columnas en n(%)
+  select(
+    variable, Total_Samples,
+    `Good Bead Count n(%)`, `Low Bead Count n(%)`, `Low Acceptable Bead Count n(%)`,
+    `Above ULQ - extrapolated based on standard curve n(%)`,
+    `Above ULQ - set to non-calculated ULQ n(%)`,
+    `Good quality n(%)`,
+    `Under LLQ - extrapolated based on standard curve n(%)`,
+    `Under LLQ - set to non-calculated LLQ n(%)`
+  )
+
+# Guardar QC en CSV (todo como n(%))
+write.csv2(qc_table_npct, "QC_Summary_ByVariable_npct.csv", row.names = FALSE)
+
+# ----------------- Exportar QC a Word con encabezados agrupados -----------------
+library(officer)
+library(flextable)
+
+# Detectar nombres de columnas (para ser robustos)
+bead_cols <- c("Good Bead Count n(%)", "Low Bead Count n(%)", "Low Acceptable Bead Count n(%)")
+qc_cols   <- c("Above ULQ - extrapolated based on standard curve n(%)",
+               "Above ULQ - set to non-calculated ULQ n(%)",
+               "Good quality n(%)",
+               "Under LLQ - extrapolated based on standard curve n(%)",
+               "Under LLQ - set to non-calculated LLQ n(%)")
+
+# Comprobaciones
+stopifnot(all(bead_cols %in% names(qc_table_npct)))
+stopifnot(all(qc_cols   %in% names(qc_table_npct)))
+
+# Construir flextable
+ft <- flextable(qc_table_npct)
+
+# Encabezado superior (agrupado)
+top_values <- c("variable", "Total_Samples", "Bead Count (n(%))", "Quality Check (n(%))")
+top_colwidths <- c(1, 1, length(bead_cols), length(qc_cols))
+stopifnot(sum(top_colwidths) == ncol(qc_table_npct))
+
+ft <- add_header_row(ft, values = top_values, colwidths = top_colwidths)
+ft <- align(ft, align = "center", part = "header")
+ft <- autofit(ft)
+
+# Exportar a Word
+doc <- read_docx()
+doc <- body_add_par(doc, "Quality Controls por analito (n y % )", style = "heading 1")
+doc <- body_add_flextable(doc, ft)
+print(doc, target = "QC_Summary_ByVariable_npct.docx")
+
+
+
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(ggplot2)
+})
+
+# ---------------- Output folders ----------------
+out_root   <- file.path("Luminex_QC_Output", "Combined_Histograms")
+dir.create(out_root, showWarnings = FALSE, recursive = TRUE)
+
+# ---------------- Helpers ----------------
+safe_filename <- function(x) {
+  x <- gsub("[/\\\\:*?\"<>|]+", "_", x)
+  x <- gsub("\\s+", "_", x)
+  x
+}
+to_num <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(gsub(",", ".", x)))
+}
+
+# ---------------- Data prep ----------------
+stopifnot(all(c("variable","Beads","Concentration") %in% names(all_results)))
+
+ar_plot <- all_results %>%
+  mutate(
+    variable      = as.character(variable),
+    Beads         = to_num(Beads),
+    Concentration = to_num(Concentration)
+  )
+
+# (opcional) excluir controles tipo POOL/ST
+ar_plot <- ar_plot %>% filter(!grepl("POOL|^ST", sample, ignore.case = TRUE))
+
+analytes <- sort(unique(ar_plot$variable))
+n_analytes <- length(analytes)
+
+# Layout adaptativo para facet
+ncol_facets <- if (n_analytes >= 24) 6 else if (n_analytes >= 12) 5 else 4
+nrow_facets <- ceiling(n_analytes / ncol_facets)
+# Tamaño de salida proporcional al nº de paneles
+width_px  <- ncol_facets * 3.2   # ~3.2 inch por columna
+height_px <- nrow_facets * 2.6   # ~2.6 inch por fila
+
+# ---------------- 1) ALL CONCENTRATIONS (one page, faceted by analyte) ----------------
+df_vals <- ar_plot %>% filter(is.finite(Concentration))
+
+if (nrow(df_vals) > 0) {
+  p_vals <- ggplot(df_vals, aes(x = Concentration)) +
+    geom_histogram(bins = 30, fill = "#2ca02c", alpha = .85, color = "white") +
+    facet_wrap(~ variable, scales = "free", ncol = ncol_facets) +
+    labs(
+      title    = "Concentration distributions by analyte",
+      subtitle = "All files combined (no LLQ/ULQ lines)",
+      x = "Concentration",
+      y = "Frequency"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      strip.text       = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  ggsave(
+    filename = file.path(out_root, "ALL_ANALYTES_concentration_histograms.png"),
+    plot     = p_vals,
+    width    = width_px,
+    height   = height_px,
+    dpi      = 220,
+    units    = "in"
+  )
+}
+
+# ---------------- 2) ALL BEAD COUNTS (one page, faceted by analyte) ----------------
+df_beads <- ar_plot %>% filter(is.finite(Beads))
+
+if (nrow(df_beads) > 0) {
+  p_beads <- ggplot(df_beads, aes(x = Beads)) +
+    geom_histogram(bins = 30, fill = "#1f77b4", alpha = .85, color = "white") +
+    facet_wrap(~ variable, scales = "free", ncol = ncol_facets) +
+    labs(
+      title    = "Bead count distributions by analyte",
+      subtitle = "All files combined",
+      x = "Bead count",
+      y = "Frequency"
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      strip.text       = element_text(face = "bold"),
+      panel.grid.minor = element_blank()
+    )
+  
+  ggsave(
+    filename = file.path(out_root, "ALL_ANALYTES_beadcount_histograms.png"),
+    plot     = p_beads,
+    width    = width_px,
+    height   = height_px,
+    dpi      = 220,
+    units    = "in"
+  )
+}
+
+
+
+
+
+# ======================================================================
+
+# -------------- (3) CSV de concentraciones finales --------------
+# Limpieza de sample (reemplazar '=' por '-')
+combined_results$sample <- gsub("=", "-", combined_results$sample)
+
+# Excluir POOL para el análisis (según tu código)
+combined_results_filtered <- combined_results %>%
+  filter(!grepl("POOL$", sample))
+
+# Agregación por muestra + analito aplicando tu lógica
+result_concentration <- combined_results_filtered %>%
+  select(sample, Concentration, variable, Quality_check) %>%
+  group_by(sample, variable) %>%
+  summarise(
+    mean_concentration = case_when(
+      # 1) Todos Good quality -> media
+      all(Quality_check == "Good quality", na.rm = TRUE) ~ mean(Concentration, na.rm = TRUE),
+      # 2) Hay al menos un Good quality -> tomar el primero 'Good'
+      any(Quality_check == "Good quality", na.rm = TRUE) ~ {
+        tmp <- Concentration[Quality_check == "Good quality"]; tmp[!is.na(tmp)][1]
+      },
+      # 3) Todos Above ULQ y existe extrapolated -> máximo extrapolado
+      all(grepl("Above ULQ", Quality_check), na.rm = TRUE) &
+        any(grepl("extrapolated", Quality_check), na.rm = TRUE) ~ {
+          max(Concentration[grepl("extrapolated", Quality_check)], na.rm = TRUE)
+        },
+      # 4) Todos Under LLQ y existe extrapolated -> máximo extrapolado
+      all(grepl("Under LLQ", Quality_check), na.rm = TRUE) &
+        any(grepl("extrapolated", Quality_check), na.rm = TRUE) ~ {
+          max(Concentration[grepl("extrapolated", Quality_check)], na.rm = TRUE)
+        },
+      # 5) En cualquier otro caso -> máximo disponible
+      TRUE ~ max(Concentration, na.rm = TRUE)
+    ),
+    Quality_checks = paste(Quality_check, collapse = " | "),
+    n_observations = dplyr::n(),
+    .groups = "drop_last"
+  ) %>%
+  ungroup()
+
+# Wide final por muestra
+result_wide <- result_concentration %>%
+  select(sample, variable, mean_concentration) %>%
+  pivot_wider(names_from = variable, values_from = mean_concentration) %>%
+  arrange(sample)
+
+# Guardar
+write.csv(result_wide, "", row.names = FALSE)
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(stringr)
+})
+
+
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(ggplot2)
+  library(stringr)
+  library(purrr)
+  library(tibble)
+})
+
+# ==================== INPUT ====================
+if (!exists("biom")) {
+  biom <- read.csv("", stringsAsFactors = FALSE)
+}
+
+# ---------------- Helpers ----------------
+to_num <- function(x) {
+  if (is.numeric(x)) return(x)
+  suppressWarnings(as.numeric(gsub(",", ".", x)))
+}
+
+# ==================== DATA PREP ====================
+id_cols <- intersect(c("sample","study_id","redcap_event_name.factor", "sample_type"), names(biom))
+analyte_cols <- setdiff(names(biom), id_cols)
+
+long_df <- biom %>%
+  mutate(
+    redcap_event_name.factor = trimws(as.character(redcap_event_name.factor)),
+    # Día = número del evento (tal cual). Si quieres mapear 1->0, 2->4, 3->24, usa case_when.
+    day = suppressWarnings(as.numeric(redcap_event_name.factor))
+  ) %>%
+  pivot_longer(
+    cols      = all_of(analyte_cols),
+    names_to  = "analyte",
+    values_to = "concentration"
+  ) %>%
+  mutate(
+    analyte       = as.character(analyte),
+    study_id      = as.character(study_id),
+    day           = as.numeric(day),
+    concentration = to_num(concentration)
+  ) %>%
+  filter(is.finite(day), is.finite(concentration))
+
+# (opcional) excluir controles:
+# long_df <- long_df %>% filter(!grepl("POOL|^ST", sample, ignore.case = TRUE))
+
+# ====== RESUMEN: mediana por analito y día ======
+med_df <- long_df %>%
+  group_by(analyte, day) %>%
+  summarise(median_conc = median(concentration, na.rm = TRUE), .groups = "drop")
+
+# ====== Función robusta de tendencia por analito ======
+fit_trend_once <- function(df_an) {
+  # df_an: data.frame con columnas analyte, day, median_conc (un analito)
+  an <- unique(df_an$analyte)
+  x  <- df_an$day
+  y  <- df_an$median_conc
+  ux <- sort(unique(x))
+  
+  # si hay muy pocos días únicos, usar recta (lm). Si hay >=4, usar loess.
+  if (length(ux) >= 4 && length(x) >= 4) {
+    # loess estable: span relativamente alto + surface='direct' ayuda con ties
+    mod <- try(loess(median_conc ~ day, data = df_an,
+                     span = 0.8, degree = 1,
+                     control = loess.control(surface = "direct")),
+               silent = TRUE)
+    if (inherits(mod, "try-error")) {
+      # Fallback a lineal en caso de fallo
+      mod <- lm(median_conc ~ day, data = df_an)
+      xnew <- seq(min(x), max(x), length.out = 100)
+      yhat <- as.numeric(predict(mod, newdata = data.frame(day = xnew)))
+      tibble(analyte = an, day = xnew, trend = yhat, method = "lm_fallback")
+    } else {
+      xnew <- seq(min(x), max(x), length.out = 200)
+      yhat <- as.numeric(predict(mod, newdata = data.frame(day = xnew)))
+      tibble(analyte = an, day = xnew, trend = yhat, method = "loess")
+    }
+  } else if (length(ux) >= 2) {
+    mod <- lm(median_conc ~ day, data = df_an)
+    xnew <- seq(min(x), max(x), length.out = 100)
+    yhat <- as.numeric(predict(mod, newdata = data.frame(day = xnew)))
+    tibble(analyte = an, day = xnew, trend = yhat, method = "lm")
+  } else {
+    # 1 único día → trazo horizontal en ese punto
+    tibble(analyte = an, day = ux, trend = y, method = "point")
+  }
+}
+
+trend_df <- med_df %>%
+  group_by(analyte) %>%
+  group_split() %>%
+  map_dfr(fit_trend_once)
+
+# ==================== FACET LAYOUT ====================
+analytes <- sort(unique(long_df$analyte))
+n_analytes <- length(analytes)
+ncol_facets <- if (n_analytes >= 24) 6 else if (n_analytes >= 12) 5 else 4
+nrow_facets <- ceiling(n_analytes / ncol_facets)
+
+width_in  <- ncol_facets * 3.2
+height_in <- nrow_facets * 2.6
+
+# ==================== ONE-PAGE PLOT (lines + robust trend) ====================
+p_all <- ggplot() +
+  # Líneas individuales por paciente (mismo color)
+  geom_line(
+    data = long_df,
+    aes(x = day, y = concentration, group = study_id),
+    color = "#1f77b4", linewidth = 0.7, alpha = 0.7, na.rm = TRUE
+  ) +
+  # Curva negra = tendencia (loess o lm sobre mediana por día)
+  geom_line(
+    data = trend_df,
+    aes(x = day, y = trend),
+    color = "black", linewidth = 1.0, na.rm = TRUE
+  ) +
+  facet_wrap(~ analyte, scales = "free_y", ncol = ncol_facets) +
+  scale_x_continuous(breaks = sort(unique(long_df$day))) +
+  labs(
+    title    = "Patient trajectories by day (all analytes)",
+    subtitle = "Blue lines: patients; Black line: robust trend on daily medians (LOESS or linear fallback)",
+    x = "Day",
+    y = "Concentration"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position  = "none",
+    strip.text       = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+
+# (Opcional) Escala log:
+# p_all <- p_all + scale_y_log10()
+
+out_dir <- file.path("Luminex_QC_Output", "Trajectories_AllAnalytes_OnePage")
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+ggsave(
+  filename = file.path(out_dir, "ALL_ANALYTES_trajectories_by_day_LOESSrobust.png"),
+  plot     = p_all,
+  width    = width_in, height = height_in, dpi = 220, units = "in"
+)
+
+ggsave(
+  filename = file.path(out_dir, "ALL_ANALYTES_trajectories_by_day_LOESSrobust.pdf"),
+  plot     = p_all,
+  width    = width_in, height = height_in, units = "in"
+)
